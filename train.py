@@ -11,6 +11,8 @@
 
 import os
 import torch
+import pywt
+import numpy as np
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
@@ -117,13 +119,71 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
+
+        # def compute_sub_intervals(T0=600, T=15000, levels=3, coarse_weight=0.2, intermediate_weight=0.3, fine_weight=0.5):
+        #     """
+        #     Compute sub-interval boundaries for wavelet decomposition levels.
+        #     """
+        #     total_iterations = T - T0
+        #     intervals = []
+            
+        #     weights = [coarse_weight, intermediate_weight, fine_weight]  # Adjust as needed
+        #     cumulative_weight = 0
+        #     for i, weight in enumerate(weights):
+        #         start = T0 + int(cumulative_weight * total_iterations)
+        #         cumulative_weight += weight
+        #         end = T0 + int(cumulative_weight * total_iterations)
+        #         intervals.append((start, end))
+        #     return intervals
+
+        sub_intervals = [(600, 3420), (3420, 8460), (8460, 15000)]
+
+        def get_level(iteration, sub_intervals):
+            """
+            Compute weights for each wavelet level based on the current iteration.
+            """
+            for i, (start, end) in enumerate(sub_intervals):
+                if start <= iteration <= end:
+                    return i
+
+        level = get_level(iteration, sub_intervals)
+
+        coeffs_rendered = pywt.wavedec2(image.detach().cpu().numpy(), wavelet='sym4', level=3)
+        coeffs_gt = pywt.wavedec2(gt_image.detach().cpu().numpy(), wavelet='sym4', level=3)
+
+        wavelet_loss = 0.0
+        for i in range(1, 4):  # Skip level 0 (approximations)
+            coarse_level = 4 - i
+            if level != (i - 1):
+                continue
+            _, w_h, w_w = coeffs_gt[coarse_level][0].shape
+            # Compute residuals for horizontal, vertical, diagonal coefficients
+            residual_h = abs(coeffs_gt[coarse_level][0] - coeffs_rendered[coarse_level][0])
+            residual_v = abs(coeffs_gt[coarse_level][1] - coeffs_rendered[coarse_level][1])
+            residual_d = abs(coeffs_gt[coarse_level][2] - coeffs_rendered[coarse_level][2])
+
+            # residual_h /= np.std(residual_h) + 1e-8
+            # residual_v /= np.std(residual_v) + 1e-8
+            # residual_d /= np.std(residual_d) + 1e-8
+
+            norm_factor = 1 / np.sqrt(w_h * w_w)
+
+            # Weighted L2 loss for wavelet coefficients
+            wavelet_loss += norm_factor * ((residual_h**2).mean() + (residual_v**2).mean() + (residual_d**2).mean())
+
+        # L2 loss for wavelet coefficients
+        #wavelet_loss += (residual_h ** 2).mean() + (residual_v ** 2).mean() + (residual_d ** 2).mean()
+
+        # wavelet_weight = (iteration - 600) / (15000 - 600) if iteration > 600 else 0.0  # Progressively increase weight
+        #wavelet_weight = max(0.0, min(1.0, ((iteration - 600) / (15000 - 600)) ** 2))
+
         Ll1 = l1_loss(image, gt_image)
         if FUSED_SSIM_AVAILABLE:
             ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
         else:
             ssim_value = ssim(image, gt_image)
 
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value) + wavelet_loss
 
         # Depth regularization
         Ll1depth_pure = 0.0
