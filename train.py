@@ -12,6 +12,7 @@
 import os
 import torch
 import pywt
+from pytorch_wavelets import DWTForward
 import numpy as np
 from random import randint
 from utils.loss_utils import l1_loss, ssim
@@ -120,70 +121,94 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
 
-        # def compute_sub_intervals(T0=600, T=15000, levels=3, coarse_weight=0.2, intermediate_weight=0.3, fine_weight=0.5):
-        #     """
-        #     Compute sub-interval boundaries for wavelet decomposition levels.
-        #     """
-        #     total_iterations = T - T0
-        #     intervals = []
-            
-        #     weights = [coarse_weight, intermediate_weight, fine_weight]  # Adjust as needed
-        #     cumulative_weight = 0
-        #     for i, weight in enumerate(weights):
-        #         start = T0 + int(cumulative_weight * total_iterations)
-        #         cumulative_weight += weight
-        #         end = T0 + int(cumulative_weight * total_iterations)
-        #         intervals.append((start, end))
-        #     return intervals
-
-        sub_intervals = [(600, 3420), (3420, 8460), (8460, 15000)]
-
-        def get_level(iteration, sub_intervals):
-            """
-            Compute weights for each wavelet level based on the current iteration.
-            """
-            for i, (start, end) in enumerate(sub_intervals):
-                if start <= iteration <= end:
-                    return i
-
-        level = get_level(iteration, sub_intervals)
-
-        coeffs_rendered = pywt.wavedec2(image.detach().cpu().numpy(), wavelet='sym4', level=3)
-        coeffs_gt = pywt.wavedec2(gt_image.detach().cpu().numpy(), wavelet='sym4', level=3)
-
-        wavelet_loss = 0.0
-        for i in range(1, 4):  # Skip level 0 (approximations)
-            coarse_level = 4 - i
-            if level != (i - 1):
-                continue
-            _, w_h, w_w = coeffs_gt[coarse_level][0].shape
-            # Compute residuals for horizontal, vertical, diagonal coefficients
-            residual_h = abs(coeffs_gt[coarse_level][0] - coeffs_rendered[coarse_level][0])
-            residual_v = abs(coeffs_gt[coarse_level][1] - coeffs_rendered[coarse_level][1])
-            residual_d = abs(coeffs_gt[coarse_level][2] - coeffs_rendered[coarse_level][2])
-
-            # residual_h /= np.std(residual_h) + 1e-8
-            # residual_v /= np.std(residual_v) + 1e-8
-            # residual_d /= np.std(residual_d) + 1e-8
-
-            norm_factor = 1 / np.sqrt(w_h * w_w)
-
-            # Weighted L2 loss for wavelet coefficients
-            wavelet_loss += norm_factor * ((residual_h**2).mean() + (residual_v**2).mean() + (residual_d**2).mean())
-
-        # L2 loss for wavelet coefficients
-        #wavelet_loss += (residual_h ** 2).mean() + (residual_v ** 2).mean() + (residual_d ** 2).mean()
-
-        # wavelet_weight = (iteration - 600) / (15000 - 600) if iteration > 600 else 0.0  # Progressively increase weight
-        #wavelet_weight = max(0.0, min(1.0, ((iteration - 600) / (15000 - 600)) ** 2))
-
         Ll1 = l1_loss(image, gt_image)
         if FUSED_SSIM_AVAILABLE:
             ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
         else:
             ssim_value = ssim(image, gt_image)
 
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value) + wavelet_loss
+        wavelet_weights = [0.0, 0.0, 50.0]
+
+        if iteration > opt.densify_from_iter and iteration < opt.densify_until_iter:
+            # Progressive phase: gradually increase high-frequency weights
+            progress = (iteration - opt.densify_from_iter) / (opt.densify_until_iter - opt.densify_from_iter)
+            w_l1 = progress * 75.0
+            w_l2 = progress * 100.0
+            wavelet_weights = [w_l2, w_l1, 50.0]
+        elif iteration > opt.densify_until_iter:
+            wavelet_weights = [0.0, 0.0, 0.0]
+
+        decomp_levels = 3
+        
+        wavelet = 'sym4'
+        dwt = DWTForward(J=decomp_levels, wave=wavelet).cuda()
+
+        coeffs_rendered = dwt(image.unsqueeze(0)) # (N, C, levels, H, W)
+        coeffs_gt = dwt(gt_image.unsqueeze(0))    # (N, C, levels, H, W)
+
+        wavelet_loss = 0.0
+        _, highpass_gt = coeffs_gt
+        _, highpass_rend = coeffs_rendered
+
+        for level in range(decomp_levels):
+
+            residual_h = torch.abs(highpass_gt[level][:, :, 0] - highpass_rend[level][:, :, 0])  # LH (horizontal)
+            residual_v = torch.abs(highpass_gt[level][:, :, 1] - highpass_rend[level][:, :, 1])  # HL (vertical)
+            residual_d = torch.abs(highpass_gt[level][:, :, 2] - highpass_rend[level][:, :, 2])  # HH (diagonal)
+
+            num_coeffs = residual_d.numel()
+            norm_factor = 1.0 / torch.sqrt(torch.tensor(num_coeffs, dtype=torch.float32))
+
+            # Aggregate across channels
+            residual_h = residual_h.mean()
+            residual_v = residual_v.mean()
+            residual_d = residual_d.mean()
+
+            level_loss = (residual_h.sum() + residual_v.sum() + residual_d.sum()) * norm_factor
+
+            # Compute mean of top-k values
+            wavelet_loss += level_loss * wavelet_weights[level]
+
+
+        L1_LOSS = (1.0 - opt.lambda_dssim) * Ll1
+        SSIM_LOSS = opt.lambda_dssim * (1.0 - ssim_value)
+        
+        loss = L1_LOSS + SSIM_LOSS + wavelet_loss
+
+        if iteration % 100 == 0:
+            L1_contribution = L1_LOSS.item()
+            SSIM_contribution = SSIM_LOSS.item()
+            Wavelet_contribution = wavelet_loss.item()
+
+            print(f"L1 Loss Contribution: {L1_contribution:.6f}")
+            print(f"SSIM Contribution: {SSIM_contribution:.6f}")
+            print(f"Wavelet Regularization Contribution: {Wavelet_contribution:.6f}")
+            print(f"Total Loss: {loss.item():.6f}")
+
+            total_contribution = L1_contribution + SSIM_contribution + Wavelet_contribution
+            L1_ratio = L1_contribution / total_contribution
+            SSIM_ratio = SSIM_contribution / total_contribution
+            Wavelet_ratio = Wavelet_contribution / total_contribution
+
+            print(f"Relative Contributions: L1 = {L1_ratio:.2%}, SSIM = {SSIM_ratio:.2%}, Wavelet = {Wavelet_ratio:.2%}")
+
+            gaussians.optimizer.zero_grad()       
+            
+            L1_LOSS.backward(retain_graph=True)
+            L1_grad_xyz = gaussians._xyz.grad.norm().item()
+            print(f"L1 Gradient Magnitude (XYZ): {L1_grad_xyz:.6f}")
+
+            gaussians.optimizer.zero_grad()       
+            
+            SSIM_LOSS.backward(retain_graph=True)
+            SSIM_grad_xyz = gaussians._xyz.grad.norm().item()
+            print(f"SSIM Gradient Magnitude (XYZ): {SSIM_grad_xyz:.6f}")
+
+            gaussians.optimizer.zero_grad()       
+            
+            wavelet_loss.backward(retain_graph=True)
+            wavelet_grad_xyz = gaussians._xyz.grad.norm().item()
+            print(f"Wavelet Gradient Magnitude (XYZ): {wavelet_grad_xyz:.6f}")
 
         # Depth regularization
         Ll1depth_pure = 0.0
@@ -218,7 +243,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
+                print("\nNumber of gaussians: {}".format(gaussians.get_xyz.shape[0]))
                 scene.save(iteration)
+            if iteration == 15000:
+                print("\nNumber of gaussians: {}".format(gaussians.get_xyz.shape[0]))
 
             # Densification
             if iteration < opt.densify_until_iter:
