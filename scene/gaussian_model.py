@@ -406,7 +406,7 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
+    def densify_and_split(self, grads, grad_threshold, scene_extent, gaussians_to_densify, N=2):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
@@ -414,6 +414,8 @@ class GaussianModel:
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
+        print(f"Old ratio split: {(selected_pts_mask.sum().item() / self.get_xyz.shape[0])*100:.4f}%")
+        selected_pts_mask[gaussians_to_densify] = True
 
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         means =torch.zeros((stds.size(0), 3),device="cuda")
@@ -432,11 +434,13 @@ class GaussianModel:
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
 
-    def densify_and_clone(self, grads, grad_threshold, scene_extent):
+    def densify_and_clone(self, grads, grad_threshold, scene_extent, gaussians_to_densify):
         # Extract points that satisfy the gradient condition
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
+        print(f"Old ratio clone: {(selected_pts_mask.sum().item() / self.get_xyz.shape[0])*100:.6f}%")
+        selected_pts_mask[gaussians_to_densify] = True
         
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
@@ -449,13 +453,13 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii, gaussians_to_densify):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
         self.tmp_radii = radii
-        self.densify_and_clone(grads, max_grad, extent)
-        self.densify_and_split(grads, max_grad, extent)
+        self.densify_and_clone(grads, max_grad, extent, gaussians_to_densify)
+        self.densify_and_split(grads, max_grad, extent, gaussians_to_densify)
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:

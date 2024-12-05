@@ -11,8 +11,7 @@
 
 import os
 import torch
-import pywt
-from pytorch_wavelets import DWTForward
+from pytorch_wavelets import DWTForward, DWTInverse
 import numpy as np
 from random import randint
 from utils.loss_utils import l1_loss, ssim
@@ -112,7 +111,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
-        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        image, viewspace_point_tensor, visibility_filter, radii, pixel_to_gaussians = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["pixel_to_gaussians"]
 
         if viewpoint_cam.alpha_mask is not None:
             alpha_mask = viewpoint_cam.alpha_mask.cuda()
@@ -127,21 +126,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             ssim_value = ssim(image, gt_image)
 
-        wavelet_weights = [0.0, 0.0, 50.0]
+        wavelet_weights = [0.0, 0.0, 25.0]
 
         if iteration > opt.densify_from_iter and iteration < opt.densify_until_iter:
             # Progressive phase: gradually increase high-frequency weights
             progress = (iteration - opt.densify_from_iter) / (opt.densify_until_iter - opt.densify_from_iter)
-            w_l1 = progress * 75.0
-            w_l2 = progress * 100.0
-            wavelet_weights = [w_l2, w_l1, 50.0]
+            w_l1 = progress * 25.0
+            w_l2 = progress * 50.0
+            wavelet_weights = [w_l2, w_l1, 25.0]
         elif iteration > opt.densify_until_iter:
             wavelet_weights = [0.0, 0.0, 0.0]
 
-        decomp_levels = 3
-        
+        decomp_levels = 3      
         wavelet = 'sym4'
         dwt = DWTForward(J=decomp_levels, wave=wavelet).cuda()
+        ifm = DWTInverse(wave=wavelet).cuda()
 
         coeffs_rendered = dwt(image.unsqueeze(0)) # (N, C, levels, H, W)
         coeffs_gt = dwt(gt_image.unsqueeze(0))    # (N, C, levels, H, W)
@@ -169,13 +168,48 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Compute mean of top-k values
             wavelet_loss += level_loss * wavelet_weights[level]
 
+        # Compute discrepancies in wavelet coefficients
+        discrepancy_coeffs = []
+        for gt_c, rend_c in zip(coeffs_gt[1], coeffs_rendered[1]):  # Iterate over levels
+            # Compute absolute differences for each high-frequency sub-band
+            discrepancy_level = torch.abs(gt_c - rend_c)  # Shape: [N, C, 3, H, W]
+            discrepancy_coeffs.append(discrepancy_level)
+
+        # Use zeros for the approximation coefficients during reconstruction
+        approx_zeros = torch.zeros_like(coeffs_gt[0])
+
+        # Reconstruct discrepancies back to pixel space
+        reconstructed_discrepancy = ifm((approx_zeros, discrepancy_coeffs))
+
+        # Sum across color channels to get per-pixel discrepancy
+        per_pixel_discrepancy = reconstructed_discrepancy.sum(dim=1) > 0.12  # [B, H, W]
+
+        _, height, width = gt_image.shape
+
+        per_pixel_discrepancy = per_pixel_discrepancy[:,:height,:width]
+
+        B, H, W = per_pixel_discrepancy.shape
+        K = pixel_to_gaussians.shape[2]
+
+        # Flatten the masks and indices
+        high_discrepancy_mask_flat = per_pixel_discrepancy.view(-1)  # [B*H*W]
+        pixel_to_gaussians_flat = pixel_to_gaussians.view(-1, K)     # [B*H*W, K]
+
+        # Filter indices where the pixel has high discrepancy
+        selected_gaussians = pixel_to_gaussians_flat[high_discrepancy_mask_flat]  # [N, K]
+
+        # Remove invalid indices (-1)
+        valid_gaussians = selected_gaussians[selected_gaussians >= 0]
+
+        # Get unique Gaussian indices
+        gaussians_to_densify = torch.unique(valid_gaussians.long())
 
         L1_LOSS = (1.0 - opt.lambda_dssim) * Ll1
         SSIM_LOSS = opt.lambda_dssim * (1.0 - ssim_value)
         
         loss = L1_LOSS + SSIM_LOSS + wavelet_loss
 
-        if iteration % 100 == 0:
+        if iteration % 500 == 0:
             L1_contribution = L1_LOSS.item()
             SSIM_contribution = SSIM_LOSS.item()
             Wavelet_contribution = wavelet_loss.item()
@@ -209,6 +243,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             wavelet_loss.backward(retain_graph=True)
             wavelet_grad_xyz = gaussians._xyz.grad.norm().item()
             print(f"Wavelet Gradient Magnitude (XYZ): {wavelet_grad_xyz:.6f}")
+            print("--------------------------------------------")
+            ratio = gaussians_to_densify.shape[0] / gaussians.get_xyz.shape[0]
+            print(f"Affected gaussians: {ratio*100:.4f}%")
 
         # Depth regularization
         Ll1depth_pure = 0.0
@@ -256,7 +293,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.021, scene.cameras_extent, size_threshold, radii, gaussians_to_densify)
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
