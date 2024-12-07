@@ -406,7 +406,7 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, gaussians_to_densify, N=2):
+    def densify_and_split(self, grads, grad_threshold, scene_extent, gaussians_to_densify=None, N=2):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
@@ -415,7 +415,9 @@ class GaussianModel:
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
         print(f"Old ratio split: {(selected_pts_mask.sum().item() / self.get_xyz.shape[0])*100:.4f}%")
-        selected_pts_mask[gaussians_to_densify] = True
+        if gaussians_to_densify is not None:
+            selected_pts_mask[gaussians_to_densify] = True
+            print(f"{selected_pts_mask.sum().item()} wavelet points split")
 
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         means =torch.zeros((stds.size(0), 3),device="cuda")
@@ -434,13 +436,15 @@ class GaussianModel:
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
 
-    def densify_and_clone(self, grads, grad_threshold, scene_extent, gaussians_to_densify):
+    def densify_and_clone(self, grads, grad_threshold, scene_extent, gaussians_to_densify=None):
         # Extract points that satisfy the gradient condition
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
         print(f"Old ratio clone: {(selected_pts_mask.sum().item() / self.get_xyz.shape[0])*100:.6f}%")
-        selected_pts_mask[gaussians_to_densify] = True
+        if gaussians_to_densify is not None:
+            selected_pts_mask[gaussians_to_densify] = True
+            print(f"{selected_pts_mask.sum().item()} wavelet points clone")
         
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
