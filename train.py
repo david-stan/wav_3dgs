@@ -127,14 +127,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             ssim_value = ssim(image, gt_image)
 
-        wavelet_weights = [0.0, 0.0, 15.0]
+        wavelet_weights = [0.0, 0.0, 20.0]
 
         if iteration > opt.densify_from_iter and iteration < opt.densify_until_iter:
             # Progressive phase: gradually increase high-frequency weights
             progress = (iteration - opt.densify_from_iter) / (opt.densify_until_iter - opt.densify_from_iter)
-            w_l1 = progress * 20.0
-            w_l2 = progress * 50.0
-            wavelet_weights = [w_l2, w_l1, 15.0]
+            w_l1 = progress * 30.0
+            w_l2 = progress * 60.0
+            wavelet_weights = [w_l2, w_l1, 20.0]
         elif iteration > opt.densify_until_iter:
             wavelet_weights = [0.0, 0.0, 0.0]
 
@@ -171,7 +171,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         gaussians_to_densify = None
 
-        if iteration >= opt.densify_from_iter and iteration <= opt.densify_until_iter:
+        if False and iteration >= opt.densify_from_iter and iteration <= opt.densify_until_iter:
             # Compute discrepancies in wavelet coefficients
             discrepancy_coeffs = []
             for gt_c, rend_c in zip(coeffs_gt[1], coeffs_rendered[1]):  # Iterate over levels
