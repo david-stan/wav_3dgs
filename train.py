@@ -210,7 +210,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # if 7001 <= iteration <= 9000:
             #     percentile = 0.25
             if 7001 <= iteration <= opt.densify_until_iter:
-                percentile = 0.999
+                percentile = 0.995
 
             cutoff = torch.quantile(normalized_tensor.flatten(), percentile)
             discrepancy_mask = per_pixel_discrepancy > cutoff 
