@@ -461,6 +461,14 @@ class GaussianModel:
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
+        max_primitives = 1_000_000
+        current_count = self.get_xyz.shape[0]
+        budget_remaining = max_primitives - current_count
+
+        # Optionally also do a per-step fraction
+        step_budget = int(0.05 * current_count)  # e.g. 5% of current
+        allowed_to_create = min(budget_remaining, step_budget)
+
         self.tmp_radii = radii
         self.densify_and_clone(grads, max_grad, extent, gaussians_to_densify)
         self.densify_and_split(grads, max_grad, extent, gaussians_to_densify)

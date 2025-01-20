@@ -193,6 +193,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             per_pixel_discrepancy = per_pixel_discrepancy[:,:height,:width]
 
             B, H, W = per_pixel_discrepancy.shape
+            pixel_to_gaussians = pixel_to_gaussians.view(height, width, 5)
             pixel_to_gaussians = pixel_to_gaussians[:,:,:3]
             K = pixel_to_gaussians.shape[2]
             if iteration == 500:
